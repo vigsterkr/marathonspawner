@@ -1,0 +1,2 @@
+jupyterhub>=0.4
+marathon
