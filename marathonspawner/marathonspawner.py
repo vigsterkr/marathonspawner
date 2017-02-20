@@ -1,9 +1,10 @@
 import time
 import socket
+from urllib.parse import urlparse, urlunparse
 
 from textwrap import dedent
 from tornado import gen
-from traitlets import Dict, List, Unicode
+from traitlets import Integer, List, Unicode
 
 from marathon import MarathonClient
 from marathon.models.app import MarathonApp, MarathonHealthCheck
@@ -64,6 +65,11 @@ class MarathonSpawner(Spawner):
     hub_ip_connect = Unicode(
         "",
         help="Public IP address of the hub"
+        ).tag(config=True)
+
+    hub_port_connect = Integer(
+        -1,
+        help="Public PORT of the hub"
         ).tag(config=True)
 
     def __init__(self, *args, **kwargs):
@@ -127,12 +133,17 @@ class MarathonSpawner(Spawner):
         return (ip, app.tasks[0].ports[0])
 
     def _public_hub_api_url(self):
-        proto, path = self.hub.api_url.split('://', 1)
-        ip, rest = path.split(':', 1)
-        return '{proto}://{ip}:{rest}'.format(
-            proto=proto,
-            ip=self.hub_ip_connect,
-            rest=rest
+        uri = urlparse(self.hub.api_url)
+        port = self.hub_port_connect if self.hub_port_connect > 0 else uri.port
+        ip = self.hub_ip_connect if self.hub_ip_connect else uri.hostname
+        return urlunparse((
+            uri.scheme,
+            '%s:%s' % (ip, port),
+            uri.path,
+            uri.params,
+            uri.query,
+            uri.fragment
+            )
         )
 
     def get_env(self):
@@ -148,7 +159,7 @@ class MarathonSpawner(Spawner):
         if self.notebook_dir:
             env['NOTEBOOK_DIR'] = self.notebook_dir
 
-        if self.hub_ip_connect:
+        if self.hub_ip_connect or self.hub_port_connect > 0:
             hub_api_url = self._public_hub_api_url()
         else:
             hub_api_url = self.hub.api_url
