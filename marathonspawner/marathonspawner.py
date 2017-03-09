@@ -4,7 +4,7 @@ from urllib.parse import urlparse, urlunparse
 
 from textwrap import dedent
 from tornado import gen
-from traitlets import Integer, List, Unicode
+from traitlets import Any, Integer, List, Unicode, default
 
 from marathon import MarathonClient
 from marathon.models.app import MarathonApp, MarathonHealthCheck
@@ -12,6 +12,8 @@ from marathon.models.container import MarathonContainerPortMapping, \
     MarathonContainer, MarathonContainerVolume, MarathonDockerContainer
 from marathon.models.constraint import MarathonConstraint
 from jupyterhub.spawner import Spawner
+
+from .volumenaming import default_format_volume_name
 
 
 class MarathonSpawner(Spawner):
@@ -53,6 +55,10 @@ class MarathonSpawner(Spawner):
                     "mode": "RW"
                 }
             ]
+
+            Note that using the template variable {username} in containerPath,
+            hostPath or the name variable in case it's an external drive
+            it will be replaced with the current user's name.
             """
         )
     ).tag(config=True)
@@ -72,8 +78,20 @@ class MarathonSpawner(Spawner):
         help="Public PORT of the hub"
         ).tag(config=True)
 
+    format_volume_name = Any(
+        help="""Any callable that accepts a string template and a Spawner
+        instance as parameters in that order and returns a string.
+        """
+    ).tag(config=True)
+
+    @default('format_volume_name')
+    def _get_default_format_volume_name(self):
+        return default_format_volume_name
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if self.mem_limit is None:
+            self.mem_limit = '1G'
         self.marathon = MarathonClient(self.marathon_host)
 
     @property
@@ -105,7 +123,12 @@ class MarathonSpawner(Spawner):
     def get_volumes(self):
         volumes = []
         for v in self.volumes:
-            volumes.append(MarathonContainerVolume.from_json(v))
+            mv = MarathonContainerVolume.from_json(v)
+            mv.container_path = self.format_volume_name(mv.container_path, self)
+            mv.host_path = self.format_volume_name(mv.host_path, self)
+            if mv.external and 'name' in mv.external:
+                mv.external['name'] = self.format_volume_name(mv.external['name'], self)
+            volumes.append(mv)
         return volumes
 
     def get_port_mappings(self):
