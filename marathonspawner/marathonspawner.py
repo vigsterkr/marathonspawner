@@ -1,9 +1,11 @@
 import time
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, urlunparse
 
 from textwrap import dedent
 from tornado import gen
+from tornado.concurrent import run_on_executor
 from traitlets import Any, Integer, List, Unicode, default
 
 from marathon import MarathonClient
@@ -11,6 +13,7 @@ from marathon.models.app import MarathonApp, MarathonHealthCheck
 from marathon.models.container import MarathonContainerPortMapping, \
     MarathonContainer, MarathonContainerVolume, MarathonDockerContainer
 from marathon.models.constraint import MarathonConstraint
+from marathon.exceptions import NotFoundError
 from jupyterhub.spawner import Spawner
 
 from .volumenaming import default_format_volume_name
@@ -88,10 +91,16 @@ class MarathonSpawner(Spawner):
     def _get_default_format_volume_name(self):
         return default_format_volume_name
 
+    _executor = None
+    @property
+    def executor(self):
+        cls = self.__class__
+        if cls._executor is None:
+            cls._executor = ThreadPoolExecutor(1)
+        return cls._executor
+
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if self.mem_limit is None:
-            self.mem_limit = '1G'
+        super(MarathonSpawner, self).__init__(*args, **kwargs)
         self.marathon = MarathonClient(self.marathon_host)
 
     @property
@@ -99,7 +108,7 @@ class MarathonSpawner(Spawner):
         return '/%s/%s' % (self.app_prefix, self.user.name)
 
     def get_state(self):
-        state = super().get_state()
+        state = super(MarathonSpawner, self).get_state()
         state['container_name'] = self.container_name
         return state
 
@@ -116,8 +125,7 @@ class MarathonSpawner(Spawner):
             interval_seconds=60,
             timeout_seconds=20,
             max_consecutive_failures=0
-            )
-        )
+            ))
         return health_checks
 
     def get_volumes(self):
@@ -148,12 +156,36 @@ class MarathonSpawner(Spawner):
         for c in self.marathon_constraints:
             constraints.append(MarathonConstraint.from_json(c))
 
-    def get_ip_and_port(self):
-        app = self.marathon.get_app(self.container_name, embed_tasks=True)
-        assert len(app.tasks) == 1
+    @run_on_executor
+    def get_deployment(self, deployment_id):
+        deployments = self.marathon.list_deployments()
+        for d in deployments:
+            if d.id == deployment_id:
+                return d
+        return None
 
-        ip = socket.gethostbyname(app.tasks[0].host)
-        return (ip, app.tasks[0].ports[0])
+    @run_on_executor
+    def get_deployment_for_app(self, app_name):
+        deployments = self.marathon.list_deployments()
+        for d in deployments:
+            if app_name in d.affected_apps:
+                return d
+        return None
+
+    def get_ip_and_port(self, app_info):
+        assert len(app_info.tasks) == 1
+        ip = socket.gethostbyname(app_info.tasks[0].host)
+        return (ip, app_info.tasks[0].ports[0])
+
+    @run_on_executor
+    def get_app_info(self, app_name):
+        try:
+            app = self.marathon.get_app(app_name, embed_tasks=True)
+        except NotFoundError:
+            self.log.info("The %s application has not been started yet", app_name)
+            return None
+        else:
+            return app
 
     def _public_hub_api_url(self):
         uri = urlparse(self.hub.api_url)
@@ -166,8 +198,7 @@ class MarathonSpawner(Spawner):
             uri.params,
             uri.query,
             uri.fragment
-            )
-        )
+            ))
 
     def get_env(self):
         env = super(MarathonSpawner, self).get_env()
@@ -202,47 +233,61 @@ class MarathonSpawner(Spawner):
             volumes=self.get_volumes())
 
         # the memory request in marathon is in MiB
-        mem_request = self.mem_limit / 1024.0 / 1024.0
+        if hasattr(self, 'mem_limit') and self.mem_limit is not None:
+            mem_request = self.mem_limit / 1024.0 / 1024.0
+        else:
+            mem_request = 1024.0
+
         app_request = MarathonApp(
-                id=self.container_name,
-                env=self.get_env(),
-                cpus=self.cpu_limit,
-                mem=mem_request,
-                container=app_container,
-                constraints=self.get_constraints(),
-                health_checks=self.get_health_checks(),
-                instances=1
+            id=self.container_name,
+            env=self.get_env(),
+            cpus=self.cpu_limit,
+            mem=mem_request,
+            container=app_container,
+            constraints=self.get_constraints(),
+            health_checks=self.get_health_checks(),
+            instances=1
             )
 
-        try:
-            app = self.marathon.create_app(self.container_name, app_request)
-            if app is False:
-                return None
-        except:
+        app = self.marathon.create_app(self.container_name, app_request)
+        if app is False or app.deployments is None:
+            self.log.error("Failed to create application for %s", self.container_name)
             return None
 
-        for i in range(self.start_timeout):
-            running = yield self.poll()
-            if running is None:
-                ip, port = self.get_ip_and_port()
-                self.user.server.ip = ip
-                self.user.server.port = port
-                return (ip, port)
-            time.sleep(1)
-        return None
+        while True:
+            app_info = yield self.get_app_info(self.container_name)
+            if app_info and app_info.tasks_healthy == 1:
+                ip, port = self.get_ip_and_port(app_info)
+                break
+            yield gen.sleep(1)
+        return (ip, port)
 
     @gen.coroutine
     def stop(self, now=False):
-        self.marathon.delete_app(self.container_name)
-        return
+        try:
+            status = self.marathon.delete_app(self.container_name)
+        except:
+            self.log.error("Could not delete application %s", self.container_name)
+            raise
+        else:
+            if not now:
+                while True:
+                    deployment = yield self.get_deployment(status['deploymentId'])
+                    if deployment is None:
+                        break
+                    yield gen.sleep(1)
 
     @gen.coroutine
     def poll(self):
-        try:
-            app = self.marathon.get_app(self.container_name)
-        except Exception as e:
-            return ""
-        else:
-            if app.tasks_healthy == 1:
-                return None
-            return ""
+        deployment = yield self.get_deployment_for_app(self.container_name)
+        if deployment:
+            for current_action in deployment.current_actions:
+                if current_action.action == 'StopApplication':
+                    self.log.error("Application %s is shutting down", self.container_name)
+                    return 1
+            return None
+
+        app_info = yield self.get_app_info(self.container_name)
+        if app_info and app_info.tasks_healthy == 1:
+            return None
+        return 0
