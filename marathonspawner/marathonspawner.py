@@ -155,6 +155,7 @@ class MarathonSpawner(Spawner):
         constraints = []
         for c in self.marathon_constraints:
             constraints.append(MarathonConstraint.from_json(c))
+        return constraints
 
     @run_on_executor
     def get_deployment(self, deployment_id):
