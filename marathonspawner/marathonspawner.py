@@ -2,11 +2,12 @@ import time
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, urlunparse
+import warnings
 
 from textwrap import dedent
 from tornado import gen
 from tornado.concurrent import run_on_executor
-from traitlets import Any, Integer, List, Unicode, default
+from traitlets import Any, Integer, List, Unicode, default, observe
 
 from marathon import MarathonClient
 from marathon.models.app import MarathonApp, MarathonHealthCheck
@@ -18,10 +19,12 @@ from jupyterhub.spawner import Spawner
 
 from .volumenaming import default_format_volume_name
 
+import jupyterhub
+_jupyterhub_xy = '%i.%i' % (jupyterhub.version_info[:2])
 
 class MarathonSpawner(Spawner):
 
-    app_image = Unicode("jupyterhub/singleuser", config=True)
+    app_image = Unicode("jupyterhub/singleuser:%s" % _jupyterhub_xy, config=True)
 
     app_prefix = Unicode(
         "jupyter",
@@ -76,10 +79,28 @@ class MarathonSpawner(Spawner):
         help="Public IP address of the hub"
         ).tag(config=True)
 
+    @observe('hub_ip_connect')
+    def _ip_connect_changed(self, change):
+        if jupyterhub.version_info >= (0, 8):
+            warnings.warn(
+                "MarathonSpawner.hub_ip_connect is no longer needed with JupyterHub 0.8."
+                "  Use JupyterHub.hub_connect_ip instead.",
+                DeprecationWarning,
+            )
+
     hub_port_connect = Integer(
         -1,
         help="Public PORT of the hub"
         ).tag(config=True)
+
+    @observe('hub_port_connect')
+    def _port_connect_changed(self, change):
+        if jupyterhub.version_info >= (0, 8):
+            warnings.warn(
+                "MarathonSpawner.hub_port_connect is no longer needed with JupyterHub 0.8."
+                "  Use JupyterHub.hub_connect_port instead.",
+                DeprecationWarning,
+            )
 
     format_volume_name = Any(
         help="""Any callable that accepts a string template and a Spawner
@@ -90,6 +111,16 @@ class MarathonSpawner(Spawner):
     @default('format_volume_name')
     def _get_default_format_volume_name(self):
         return default_format_volume_name
+
+    # fix default port to 8888, used in the container
+    @default('port')
+    def _port_default(self):
+        return 8888
+
+    # default to listening on all-interfaces in the container
+    @default('ip')
+    def _ip_default(self):
+        return '0.0.0.0'
 
     _executor = None
     @property
@@ -122,7 +153,7 @@ class MarathonSpawner(Spawner):
             protocol='TCP',
             port_index=0,
             grace_period_seconds=300,
-            interval_seconds=60,
+            interval_seconds=30,
             timeout_seconds=20,
             max_consecutive_failures=0
             ))
@@ -201,25 +232,17 @@ class MarathonSpawner(Spawner):
             uri.fragment
             ))
 
-    def get_env(self):
-        env = super(MarathonSpawner, self).get_env()
-        env.update(dict(
-            # Jupyter Hub config
-            JPY_USER=self.user.name,
-            JPY_COOKIE_NAME=self.user.server.cookie_name,
-            JPY_BASE_URL=self.user.server.base_url,
-            JPY_HUB_PREFIX=self.hub.server.base_url,
-        ))
-
-        if self.notebook_dir:
-            env['NOTEBOOK_DIR'] = self.notebook_dir
-
-        if self.hub_ip_connect or self.hub_port_connect > 0:
-            hub_api_url = self._public_hub_api_url()
-        else:
-            hub_api_url = self.hub.api_url
-        env['JPY_HUB_API_URL'] = hub_api_url
-        return env
+    def get_args(self):
+        args = super().get_args()
+        if self.hub_ip_connect:
+            # JupyterHub 0.7 specifies --hub-api-url
+            # on the command-line, which is hard to update
+            for idx, arg in enumerate(list(args)):
+                if arg.startswith('--hub-api-url='):
+                    args.pop(idx)
+                    break
+            args.append('--hub-api-url=%s' % self._public_hub_api_url())
+        return args
 
     @gen.coroutine
     def start(self):
@@ -239,8 +262,10 @@ class MarathonSpawner(Spawner):
         else:
             mem_request = 1024.0
 
+        cmd = self.cmd + self.get_args()
         app_request = MarathonApp(
             id=self.container_name,
+            cmd=' '.join(cmd),
             env=self.get_env(),
             cpus=self.cpu_limit,
             mem=mem_request,
